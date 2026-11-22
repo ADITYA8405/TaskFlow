@@ -1,0 +1,161 @@
+{% extends "tasks/base.html" %}
+
+{% block title %}My Tasks | TaskFlow{% endblock %}
+
+{% block content %}
+{% now "Y-m-d" as today %}
+
+<div class="dashboard-header">
+    <h1 class="dashboard-title">Dashboard</h1>
+    <p class="dashboard-subtitle">Manage your tasks efficiently.</p>
+</div>
+
+<!-- Dashboard Statistics -->
+<dl class="summary-cards">
+
+    <div class="card summary-card">
+        <dt>Total Tasks</dt>
+        <dd>{{ stats.total }}</dd>
+    </div>
+
+    <div class="card summary-card">
+        <dt>Completed</dt>
+        <dd>{{ stats.completed }}</dd>
+    </div>
+
+    <div class="card summary-card">
+        <dt>Pending</dt>
+        <dd>{{ stats.pending }}</dd>
+    </div>
+
+    <div class="card summary-card">
+        <dt>In Progress</dt>
+        <dd>{{ stats.in_progress }}</dd>
+    </div>
+
+    <div class="card summary-card{% if stats.overdue %} summary-card-alert{% endif %}">
+        <dt>Overdue</dt>
+        <dd>{{ stats.overdue }}</dd>
+    </div>
+
+    <div class="card summary-card">
+        <dt>Completion Rate</dt>
+        <dd>
+            {{ completion_rate }}%
+            <div class="progress-track" aria-hidden="true">
+                <div class="progress-fill" style="width: {{ completion_rate }}%"></div>
+            </div>
+        </dd>
+    </div>
+
+</dl>
+
+<!-- Search and Filter Section -->
+<form method="GET" action="{% url 'task_list' %}" class="card filter-form">
+
+    <!-- Search by task title -->
+    <div class="filter-field filter-field-search">
+        <label for="filter-search">Search</label>
+        <input id="filter-search" type="text" name="search" placeholder="Search tasks..." value="{{ search_query }}">
+    </div>
+
+    <!-- Filter by status -->
+    <div class="filter-field">
+        <label for="filter-status">Status</label>
+        <select id="filter-status" name="status">
+            <option value="">All Statuses</option>
+            <option value="PENDING" {% if status_filter == 'PENDING' %}selected{% endif %}>Pending</option>
+            <option value="IN_PROGRESS" {% if status_filter == 'IN_PROGRESS' %}selected{% endif %}>In Progress</option>
+            <option value="COMPLETED" {% if status_filter == 'COMPLETED' %}selected{% endif %}>Completed</option>
+        </select>
+    </div>
+
+    <!-- Filter by priority -->
+    <div class="filter-field">
+        <label for="filter-priority">Priority</label>
+        <select id="filter-priority" name="priority">
+            <option value="">All Priorities</option>
+            <option value="LOW" {% if priority_filter == 'LOW' %}selected{% endif %}>Low</option>
+            <option value="MEDIUM" {% if priority_filter == 'MEDIUM' %}selected{% endif %}>Medium</option>
+            <option value="HIGH" {% if priority_filter == 'HIGH' %}selected{% endif %}>High</option>
+        </select>
+    </div>
+
+    <div class="filter-actions">
+        <button type="submit" class="btn btn-primary">Apply Filters</button>
+        <a href="{% url 'task_list' %}" class="btn btn-secondary">Clear Filters</a>
+    </div>
+
+</form>
+
+<!-- Task List -->
+<div class="section-header">
+    <h2 class="section-title">Tasks</h2>
+    <span class="section-count">Showing {{ tasks|length }} of {{ stats.total }}</span>
+</div>
+
+<div class="task-grid">
+
+    {% for task in tasks %}
+
+        <article class="card task-card{% if task.due_date and task.status != 'COMPLETED' and task.due_date|date:'Y-m-d' < today %} task-card-overdue{% endif %}">
+
+            <!-- Task Title -->
+            <h3 class="task-title">{{ task.title }}</h3>
+
+            <!-- Task Description -->
+            {% if task.description %}
+                <p class="task-description">{{ task.description }}</p>
+            {% else %}
+                <p class="task-description task-description-empty">No description</p>
+            {% endif %}
+
+            <!-- Status and Priority -->
+            <div class="task-badges">
+                <span class="badge badge-status-{{ task.status|lower }}">{{ task.get_status_display }}</span>
+                <span class="badge badge-priority-{{ task.priority|lower }}">{{ task.get_priority_display }}</span>
+            </div>
+
+            <!-- Due Date and Task Actions -->
+            <div class="task-footer">
+
+                <div class="task-due-group">
+                    {% if task.due_date %}
+                        <span class="task-due">Due <time datetime="{{ task.due_date|date:'Y-m-d' }}">{{ task.due_date|date:"d M Y" }}</time></span>
+                    {% else %}
+                        <span class="task-due task-due-none">No due date</span>
+                    {% endif %}
+
+                    {% if task.due_date and task.status != 'COMPLETED' and task.due_date|date:'Y-m-d' < today %}
+                        <span class="badge badge-overdue">Overdue</span>
+                    {% endif %}
+                </div>
+
+                <div class="task-actions">
+                    <a class="btn btn-secondary btn-sm" href="{% url 'edit_task' task.id %}">Edit</a>
+                    <a class="btn btn-danger btn-sm" href="{% url 'delete_task' task.id %}">Delete</a>
+                </div>
+
+            </div>
+
+        </article>
+
+    {% empty %}
+
+        <div class="card empty-state">
+            {% if stats.total == 0 %}
+                <h3 class="empty-state-title">No tasks yet</h3>
+                <p class="empty-state-text">Create your first task to start tracking your work.</p>
+                <a class="btn btn-primary" href="{% url 'create_task' %}">Create a new task</a>
+            {% else %}
+                <h3 class="empty-state-title">No matching tasks</h3>
+                <p class="empty-state-text">Try a different search or change your filters.</p>
+                <a class="btn btn-secondary" href="{% url 'task_list' %}">Clear Filters</a>
+            {% endif %}
+        </div>
+
+    {% endfor %}
+
+</div>
+
+{% endblock %}

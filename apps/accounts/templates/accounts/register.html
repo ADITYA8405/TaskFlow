@@ -1,0 +1,25 @@
+{% extends "tasks/base.html" %}
+
+{% block title %}Create Account | TaskFlow{% endblock %}
+
+{% block content %}
+<div class="auth-container">
+    <div class="auth-card card">
+        <div class="auth-header">
+            <span class="brand-icon" aria-hidden="true">✓</span>
+            <h1 class="auth-title">Create Your Account</h1>
+            <p class="auth-subtitle">Sign up to start managing your tasks.</p>
+        </div>
+
+        <form method="POST" class="auth-form">
+            {% csrf_token %}
+            {% include "tasks/_form_fields.html" %}
+            <button type="submit" class="btn btn-primary btn-block">Create Account</button>
+        </form>
+
+        <div class="auth-footer">
+            <p>Already have an account? <a href="{% url 'login' %}">Log in</a></p>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% if form.non_field_errors %}
+    <div class="message message-error form-alert" role="alert">{{ form.non_field_errors }}</div>
+{% endif %}
+
+{% for hidden in form.hidden_fields %}{{ hidden }}{% endfor %}
+
+<div class="form-fields">
+    {% for field in form.visible_fields %}
+        <div class="form-field form-field-{{ field.name }}{% if field.errors %} has-error{% endif %}">
+            <label for="{{ field.id_for_label }}">
+                {{ field.label }}
+                {% if not field.field.required %}<span class="form-optional">Optional</span>{% endif %}
+            </label>
+
+            {% if field.name == 'due_date' %}
+                <input
+                    type="date"
+                    name="{{ field.html_name }}"
+                    id="{{ field.id_for_label }}"
+                    value="{% if form.is_bound %}{{ field.value|default_if_none:'' }}{% else %}{{ field.value|date:'Y-m-d' }}{% endif %}"
+                    autocomplete="off"
+                    {% if field.errors %}aria-invalid="true" aria-describedby="{{ field.auto_id }}_error"{% endif %}
+                >
+            {% else %}
+                {{ field }}
+            {% endif %}
+
+            {{ field.errors }}
+
+            {% if field.help_text %}
+                <div class="form-help" id="{{ field.auto_id }}_helptext">{{ field.help_text|safe }}</div>
+            {% endif %}
+        </div>
+    {% endfor %}
+</div>
