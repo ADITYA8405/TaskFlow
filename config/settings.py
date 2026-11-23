@@ -85,12 +85,49 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+DB_ENGINE = os.environ.get('DB_ENGINE', '').strip().lower() or 'sqlite'
+
+if DB_ENGINE == 'sqlite':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
+elif DB_ENGINE == 'postgres':
+    required_postgres_settings = (
+        'POSTGRES_DB',
+        'POSTGRES_USER',
+        'POSTGRES_PASSWORD',
+        'POSTGRES_HOST',
+        'POSTGRES_PORT',
+    )
+    # Report variable names only, so errors can never reveal a credential.
+    missing_postgres_settings = [
+        name for name in required_postgres_settings
+        if not os.environ.get(name, '').strip()
+    ]
+    if missing_postgres_settings:
+        raise ImproperlyConfigured(
+            'DB_ENGINE=postgres requires these missing settings: '
+            f"{', '.join(missing_postgres_settings)}. "
+            'Add them to .env, or set DB_ENGINE=sqlite.'
+        )
+
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ['POSTGRES_DB'],
+            'USER': os.environ['POSTGRES_USER'],
+            'PASSWORD': os.environ['POSTGRES_PASSWORD'],
+            'HOST': os.environ['POSTGRES_HOST'],
+            'PORT': os.environ['POSTGRES_PORT'],
+        }
+    }
+else:
+    raise ImproperlyConfigured(
+        f"Unsupported DB_ENGINE {DB_ENGINE!r}. Use 'sqlite' or 'postgres'."
+    )
 
 
 # Password validation
