@@ -7,6 +7,7 @@ from django.urls import reverse
 
 from .forms import TaskForm
 from .models import Task
+from .tasks import find_overdue_tasks
 
 User = get_user_model()
 
@@ -432,3 +433,64 @@ class DashboardStatsTests(TaskViewTestCase):
         self.assertEqual(stats['total'], 0)
         self.assertEqual(stats['pending'], 0)
         self.assertEqual(stats['overdue'], 0)
+
+
+class FindOverdueTasksTaskTests(TestCase):
+    TODAY = date(2030, 6, 15)
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='celery', password='pass12345')
+        patcher = patch('apps.tasks.tasks.timezone.localdate', return_value=self.TODAY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_task(self):
+        # .apply() runs the task in-process through Celery, without a broker.
+        return find_overdue_tasks.apply().get()
+
+    def test_reports_overdue_tasks_that_are_not_completed(self):
+        yesterday = self.TODAY - timedelta(days=1)
+        pending = make_task(self.user, 'Pending', status='PENDING', due_date=yesterday)
+        in_progress = make_task(
+            self.user, 'In progress', status='IN_PROGRESS',
+            due_date=self.TODAY - timedelta(days=10),
+        )
+        ownerless = make_task(None, 'Ownerless', status='PENDING', due_date=yesterday)
+
+        result = self.run_task()
+
+        self.assertEqual(result['checked_on'], '2030-06-15')
+        self.assertEqual(result['overdue_count'], 3)
+        self.assertEqual(
+            result['overdue_task_ids'], [in_progress.pk, pending.pk, ownerless.pk]
+        )
+
+    def test_ignores_completed_tasks_even_when_past_due(self):
+        make_task(
+            self.user, status='COMPLETED', due_date=self.TODAY - timedelta(days=5)
+        )
+
+        result = self.run_task()
+
+        self.assertEqual(result['overdue_count'], 0)
+        self.assertEqual(result['overdue_task_ids'], [])
+
+    def test_ignores_tasks_that_are_not_overdue(self):
+        make_task(self.user, 'Due today', status='PENDING', due_date=self.TODAY)
+        make_task(
+            self.user, 'Due later', status='PENDING',
+            due_date=self.TODAY + timedelta(days=1),
+        )
+        make_task(self.user, 'No due date', status='PENDING', due_date=None)
+
+        self.assertEqual(self.run_task()['overdue_count'], 0)
+
+    def test_does_not_modify_tasks(self):
+        task = make_task(
+            self.user, status='PENDING', due_date=self.TODAY - timedelta(days=1)
+        )
+        before = Task.objects.values().get(pk=task.pk)
+
+        self.run_task()
+
+        self.assertEqual(Task.objects.values().get(pk=task.pk), before)

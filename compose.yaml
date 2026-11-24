@@ -1,0 +1,57 @@
+services:
+  web:
+    build: .
+    image: taskflow-web:dev
+    # Application role only; admin credentials stay in .env.docker for db.
+    env_file:
+      - .env.docker.app
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+
+  # Runs background tasks; same image and app settings as web, different command.
+  worker:
+    build: .
+    image: taskflow-web:dev
+    command: ["celery", "-A", "config", "worker", "--loglevel=info"]
+    env_file:
+      - .env.docker.app
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:18-alpine
+    env_file:
+      - .env.docker
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    # TCP check, so the socket-only server used during first-time init is not reported healthy.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Celery broker and result store. No ports: only reachable on the Compose network.
+  redis:
+    image: redis:8-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

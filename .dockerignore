@@ -1,0 +1,24 @@
+# Secrets (keep the placeholder template)
+**/.env
+**/.env.*
+!**/.env.example
+
+# Virtual environments
+**/venv/
+**/.venv/
+
+# Git
+.git/
+
+# Python bytecode
+**/__pycache__/
+**/*.py[cod]
+
+# Local databases and backups
+**/*.sqlite3
+
+# macOS
+**/.DS_Store
+
+# Personal notes
+readme.txt
