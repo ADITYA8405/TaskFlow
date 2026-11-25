@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import OperationalError
 from django.test import TestCase
 from django.urls import reverse
 
@@ -494,3 +495,102 @@ class FindOverdueTasksTaskTests(TestCase):
         self.run_task()
 
         self.assertEqual(Task.objects.values().get(pk=task.pk), before)
+
+    def test_running_twice_gives_the_same_result_and_changes_nothing(self):
+        make_task(self.user, status='PENDING', due_date=self.TODAY - timedelta(days=1))
+        before = list(Task.objects.values().order_by('pk'))
+
+        first = self.run_task()
+        second = self.run_task()
+
+        self.assertEqual(first, second)
+        self.assertEqual(list(Task.objects.values().order_by('pk')), before)
+
+    def test_logs_a_summary_on_success(self):
+        make_task(self.user, status='PENDING', due_date=self.TODAY - timedelta(days=1))
+
+        with self.assertLogs('apps.tasks.tasks', level='INFO') as logs:
+            self.run_task()
+
+        self.assertEqual(
+            logs.output, ['INFO:apps.tasks.tasks:Found 1 overdue task(s) on 2030-06-15']
+        )
+
+
+class FindOverdueTasksReliabilityTests(TestCase):
+    """Retry and failure behaviour.
+
+    .apply() runs retries immediately in-process (the backoff countdown is not
+    waited for), so these tests are fast and need no broker.
+    """
+
+    TODAY = date(2030, 6, 15)
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='celery', password='pass12345')
+        self.overdue = make_task(
+            self.user, status='PENDING', due_date=self.TODAY - timedelta(days=1)
+        )
+        patcher = patch('apps.tasks.tasks.timezone.localdate', return_value=self.TODAY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def patch_query(self, failures, exception):
+        """Make the task's query raise `exception` for the first `failures` calls."""
+        real_filter = Task.objects.filter
+        attempts = []
+
+        def filter_with_failures(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) <= failures:
+                raise exception
+            return real_filter(*args, **kwargs)
+
+        patcher = patch.object(Task.objects, 'filter', side_effect=filter_with_failures)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return attempts
+
+    def test_retries_transient_database_errors_then_succeeds(self):
+        attempts = self.patch_query(2, OperationalError('connection refused'))
+
+        result = find_overdue_tasks.apply()
+
+        self.assertEqual(result.state, 'SUCCESS')
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(result.get()['overdue_task_ids'], [self.overdue.pk])
+
+    def test_fails_after_the_retry_limit(self):
+        attempts = self.patch_query(99, OperationalError('connection refused'))
+
+        result = find_overdue_tasks.apply()
+
+        self.assertEqual(result.state, 'FAILURE')
+        # The first attempt plus max_retries retries.
+        self.assertEqual(len(attempts), 1 + find_overdue_tasks.max_retries)
+        self.assertIsInstance(result.result, OperationalError)
+        with self.assertRaises(OperationalError):
+            result.get()
+
+    def test_does_not_retry_programming_errors(self):
+        attempts = self.patch_query(99, ValueError('bug'))
+
+        result = find_overdue_tasks.apply()
+
+        self.assertEqual(result.state, 'FAILURE')
+        self.assertEqual(len(attempts), 1)
+        self.assertIsInstance(result.result, ValueError)
+
+    def test_reliability_options(self):
+        task = find_overdue_tasks
+        self.assertEqual(task.autoretry_for, (OperationalError,))
+        self.assertEqual(task.max_retries, 5)
+        self.assertEqual(task.retry_backoff, 2)
+        self.assertEqual(task.retry_backoff_max, 60)
+        self.assertTrue(task.retry_jitter)
+        self.assertTrue(task.acks_late)
+        # Deliberately unset: a crashing worker must not cause unlimited redelivery.
+        self.assertFalse(task.reject_on_worker_lost)
+        self.assertTrue(task.track_started)
+        self.assertEqual(task.soft_time_limit, 30)
+        self.assertEqual(task.time_limit, 60)
