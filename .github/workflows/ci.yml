@@ -63,5 +63,50 @@ jobs:
       - name: Check for missing migrations
         run: python manage.py makemigrations --check --dry-run
 
+      - name: Collect static files
+        run: python manage.py collectstatic --noinput
+
+      # The job runs with production settings (DJANGO_DEBUG unset = false). Only the
+      # HTTPS redirect is turned off, because Django's test client speaks plain HTTP
+      # and every request would otherwise get a 301 instead of the page under test.
       - name: Run tests
+        env:
+          DJANGO_SECURE_SSL_REDIRECT: "false"
         run: python manage.py test
+
+      # Synthetic production environment, used only for this check:
+      # - a long random-looking key, because the short CI key above triggers W009;
+      # - a placeholder host, because an empty ALLOWED_HOSTS triggers W020;
+      # - HSTS seconds, include-subdomains and preload set so W004, W005 and W021
+      #   are evaluated as passing. These are check-only values: real deployments keep
+      #   HSTS off (0, false, false) until HTTPS is verified on the real domain.
+      - name: Django deployment check
+        env:
+          DJANGO_SECRET_KEY: ci-deploy-check-only-1f8c2b7e9a4d6f03c5b1e8a7d2f9c4b6e0a3d7f1
+          DJANGO_ALLOWED_HOSTS: taskflow.example.invalid
+          DJANGO_SECURE_HSTS_SECONDS: "1"
+          DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: "true"
+          DJANGO_SECURE_HSTS_PRELOAD: "true"
+        run: python manage.py check --deploy --fail-level WARNING
+
+      # Starts Gunicorn as the image does and fetches app and admin CSS through
+      # WhiteNoise. The proxy header stands in for a TLS-terminating proxy.
+      - name: Gunicorn static file smoke test
+        env:
+          DJANGO_ALLOWED_HOSTS: taskflow.example.invalid
+          DJANGO_BEHIND_TLS_PROXY: "true"
+        run: |
+          gunicorn config.wsgi:application --bind 127.0.0.1:8000 --pid gunicorn.pid --daemon
+          trap 'kill "$(cat gunicorn.pid)"' EXIT
+          for path in /static/tasks/css/style.css /static/admin/css/base.css; do
+            curl --fail --silent --show-error --output /dev/null \
+              --retry 10 --retry-connrefused --retry-delay 1 \
+              -H "Host: taskflow.example.invalid" -H "X-Forwarded-Proto: https" \
+              "http://127.0.0.1:8000${path}"
+            echo "OK ${path}"
+          done
+
+      # Safety checks for scripts/db_backup.sh and db_restore.sh. Stub PostgreSQL
+      # tools stand in for the database, so these touch no data.
+      - name: Backup and restore script tests
+        run: python -m unittest discover -s scripts/tests -v

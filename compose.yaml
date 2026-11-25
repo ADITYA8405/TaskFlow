@@ -2,11 +2,15 @@ services:
   web:
     build: .
     image: taskflow-web:dev
+    # Development server. The image's default command is Gunicorn (production).
+    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
     # Application role only; admin credentials stay in .env.docker for db.
     env_file:
       - .env.docker.app
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
+      # This stack is for local development; settings default to DEBUG off.
+      DJANGO_DEBUG: "true"
     depends_on:
       db:
         condition: service_healthy
@@ -24,6 +28,7 @@ services:
       - .env.docker.app
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
+      DJANGO_DEBUG: "true"
     depends_on:
       db:
         condition: service_healthy

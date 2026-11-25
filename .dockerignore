@@ -14,8 +14,13 @@
 **/__pycache__/
 **/*.py[cod]
 
+# Collected static files (the image runs collectstatic itself)
+**/staticfiles/
+
 # Local databases and backups
 **/*.sqlite3
+**/*.dump
+**/*.dump.sha256
 
 # macOS
 **/.DS_Store

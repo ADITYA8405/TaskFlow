@@ -23,8 +23,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
 
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
+def env_bool(name, default=False):
+    """Read a true/false environment variable; unset or blank uses the default."""
+    value = os.environ.get(name, '').strip().lower()
+    if not value:
+        return default
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    raise ImproperlyConfigured(f'{name} must be true or false, not {value!r}.')
+
+
+def env_list(name):
+    """Read a comma-separated environment variable as a list; unset means empty."""
+    return [item.strip() for item in os.environ.get(name, '').split(',') if item.strip()]
+
+
+# Deployment checklist: https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
+# Settings default to production-safe values. Development turns DEBUG on explicitly
+# (DJANGO_DEBUG=true in .env, and in compose.yaml for the Docker stack).
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
@@ -34,9 +52,15 @@ if not SECRET_KEY:
     )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env_bool('DJANGO_DEBUG', default=False)
 
-ALLOWED_HOSTS = []
+# Comma-separated host names, e.g. taskflow.example.com. While DEBUG is on and this
+# is empty, Django still allows localhost, 127.0.0.1 and [::1].
+ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS')
+
+# Comma-separated full origins (scheme included), e.g. https://taskflow.example.com.
+# Needed only when forms are posted from an origin Django does not see as its own.
+CSRF_TRUSTED_ORIGINS = env_list('DJANGO_CSRF_TRUSTED_ORIGINS')
 
 
 # Application definition
@@ -54,6 +78,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Serves collected static files; must stay directly after SecurityMiddleware.
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -122,8 +148,19 @@ elif DB_ENGINE == 'postgres':
             'PASSWORD': os.environ['POSTGRES_PASSWORD'],
             'HOST': os.environ['POSTGRES_HOST'],
             'PORT': os.environ['POSTGRES_PORT'],
+            'OPTIONS': {
+                # Fail with OperationalError after 10s instead of hanging when the
+                # server is unreachable; the Celery task retries that error.
+                'connect_timeout': 10,
+            },
         }
     }
+    # Optional libpq TLS mode, e.g. 'require' for Neon (which accepts only TLS) or
+    # 'verify-full' to also check the server certificate. Unset keeps libpq's
+    # default ('prefer'), as used by the local and Compose databases.
+    postgres_sslmode = os.environ.get('POSTGRES_SSLMODE', '').strip()
+    if postgres_sslmode:
+        DATABASES['default']['OPTIONS']['sslmode'] = postgres_sslmode
 else:
     raise ImproperlyConfigured(
         f"Unsupported DB_ENGINE {DB_ENGINE!r}. Use 'sqlite' or 'postgres'."
@@ -165,14 +202,63 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+# `collectstatic` gathers files here; WhiteNoise serves them when DEBUG is off.
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        # Development serves app static files directly, so no collectstatic is needed.
+        # Production uses compressed, content-hashed names that browsers can cache
+        # forever; this requires `collectstatic` to have run first.
+        'BACKEND': (
+            'django.contrib.staticfiles.storage.StaticFilesStorage'
+            if DEBUG
+            else 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+        ),
+    },
+}
+
+
+# HTTPS and cookie security (production only)
+# https://docs.djangoproject.com/en/6.1/topics/security/#ssl-https
+
+if not DEBUG:
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    # Redirect plain HTTP to HTTPS. Set to false only where the client cannot use
+    # HTTPS, such as Django's HTTP test client in CI.
+    SECURE_SSL_REDIRECT = env_bool('DJANGO_SECURE_SSL_REDIRECT', default=True)
+    # Trust X-Forwarded-Proto only behind a proxy you control that sets it on every
+    # request; otherwise clients could claim HTTPS.
+    if env_bool('DJANGO_BEHIND_TLS_PROXY', default=False):
+        SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    # HSTS stays off (0) until HTTPS is verified on the real domain: browsers cache
+    # the header, so a wrong value is hard to undo. Raise gradually (e.g. 3600, then
+    # 31536000). Only CI's deployment check sets synthetic non-default values.
+    SECURE_HSTS_SECONDS = int(os.environ.get('DJANGO_SECURE_HSTS_SECONDS', '0'))
+    # Enable only once every subdomain is served over HTTPS.
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(
+        'DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS', default=False
+    )
+    # Preload-list submission is effectively permanent; enable only deliberately.
+    SECURE_HSTS_PRELOAD = env_bool('DJANGO_SECURE_HSTS_PRELOAD', default=False)
 
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
+# TaskFlow does not send email yet. Development prints messages to the console;
+# production defaults to SMTP (configure EMAIL_HOST etc. before sending real mail).
 MAILERS = {
     'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        'BACKEND': os.environ.get('DJANGO_EMAIL_BACKEND', '').strip() or (
+            'django.core.mail.backends.console.EmailBackend'
+            if DEBUG
+            else 'django.core.mail.backends.smtp.EmailBackend'
+        ),
     },
 }
 

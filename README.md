@@ -26,8 +26,10 @@ change is verified by a PostgreSQL-backed GitHub Actions pipeline.
 - [Background Task Processing](#background-task-processing)
 - [Docker and Container Architecture](#docker-and-container-architecture)
 - [Database and Configuration](#database-and-configuration)
+- [Backup and Restore](#backup-and-restore)
 - [CI and Automated Testing](#ci-and-automated-testing)
 - [Getting Started](#getting-started)
+- [Deploying to Render and Neon (free tiers)](#deploying-to-render-and-neon-free-tiers)
 - [Engineering Decisions and Trade-offs](#engineering-decisions-and-trade-offs)
 - [Future Improvements](#future-improvements)
 - [License](#license)
@@ -56,11 +58,11 @@ container network and the CI runner.
 | Area | What the project demonstrates |
 | --- | --- |
 | Data isolation | Every task query is scoped to the signed-in user; other users' tasks return 404. |
-| Configuration | Environment-driven settings that switch between SQLite and PostgreSQL and fail fast on missing values. |
+| Configuration | Environment-driven settings that switch between SQLite and PostgreSQL, default to production-safe values (DEBUG off, HTTPS-only cookies), and fail fast on missing values. |
 | Database | PostgreSQL 18 as the containerised application database, accessed by a non-superuser application role. |
 | Asynchronous work | Celery with Redis as broker and result backend, running in a dedicated worker container. |
 | Containerisation | A Dockerfile and a four-service Docker Compose stack with health-checked start-up ordering. |
-| Quality gates | 56 automated tests and a GitHub Actions workflow running Django checks, a migration check, and the test suite against PostgreSQL. |
+| Quality gates | 62 automated tests and a GitHub Actions workflow running Django checks, a migration check, the test suite against PostgreSQL, Django's deployment check, and a Gunicorn static-file smoke test. |
 | Secret hygiene | No credentials in the image or in Git; database admin and application credentials kept in separate files. |
 
 ---
@@ -85,13 +87,14 @@ container network and the CI runner.
 | Feature | What it provides |
 | --- | --- |
 | **PostgreSQL** | The Docker stack's application database (`postgres:18-alpine`) with a persistent named volume. SQLite remains the zero-configuration default for local development. |
-| **Dockerfile** | A reproducible Python 3.13 image containing the application and its pinned dependencies, with no secrets baked in. |
+| **Dockerfile** | A reproducible Python 3.13 image containing the application, its pinned dependencies, and its collected static files, with no secrets baked in. Its default command serves the app with Gunicorn. |
+| **Production serving** | Gunicorn as the application server and WhiteNoise for compressed, cache-friendly static files; no separate web server is needed to serve CSS and admin assets. |
 | **Docker Compose** | One command starts four cooperating services — `web`, `db`, `redis`, `worker` — on a private network, in a dependency-safe order. |
 | **Separate web and worker services** | The web server handles HTTP; the Celery worker runs background jobs. They share one image and configuration but run as independent processes that can be restarted or scaled separately. |
 | **Redis** | Message broker that queues Celery tasks, and result backend that stores their return values for 24 hours. |
 | **Asynchronous task execution** | A read-only Celery task, `find_overdue_tasks`, runs in the worker against PostgreSQL and returns a summary of overdue tasks. |
-| **GitHub Actions CI** | Every push and pull request to `main` runs Django's system check, a missing-migration check, and the full test suite against a PostgreSQL 18 service container. |
-| **Automated tests** | 56 tests covering models, forms, views, access control, filters, dashboard statistics, authentication, and the Celery task. |
+| **GitHub Actions CI** | Every push and pull request to `main` runs Django's system check, a missing-migration check, `collectstatic`, the full test suite against a PostgreSQL 18 service container, `check --deploy`, and a Gunicorn smoke test that fetches app and admin CSS. |
+| **Automated tests** | 62 tests covering models, forms, views, access control, filters, dashboard statistics, authentication, and the Celery task, including its retry and failure behaviour. |
 
 ---
 
@@ -143,7 +146,10 @@ flowchart LR
     python --> install["pip install -r requirements.txt"]
     install --> check["manage.py check"]
     check --> migrations["makemigrations --check --dry-run"]
-    migrations --> tests["manage.py test"]
+    migrations --> collect["collectstatic"]
+    collect --> tests["manage.py test"]
+    tests --> deploy["check --deploy<br/>--fail-level WARNING"]
+    deploy --> smoke["Gunicorn smoke test<br/>(app + admin CSS)"]
     pg[("postgres:18 service container<br/>health-checked with pg_isready")] -.-> check
     pg -.-> tests
 ```
@@ -196,7 +202,7 @@ All Python dependencies, including transitive ones, are pinned to exact versions
 │       ├── urls.py                 # task routes
 │       ├── tasks.py                # Celery task: find_overdue_tasks
 │       ├── admin.py                # registers Task with the admin
-│       ├── tests.py                # 44 tests incl. the Celery task
+│       ├── tests.py                # 50 tests incl. the Celery task
 │       ├── migrations/
 │       │   ├── 0001_initial.py
 │       │   └── 0002_task_owner.py
@@ -216,6 +222,11 @@ All Python dependencies, including transitive ones, are pinned to exact versions
 │   ├── settings.py                 # environment-driven settings
 │   ├── urls.py                     # root URL configuration
 │   └── asgi.py, wsgi.py            # server entry points
+├── scripts/
+│   ├── db_backup.sh                # pg_dump -Fc to ~/taskflow-backups (manual)
+│   ├── db_restore.sh               # restore into an empty, non-live database
+│   ├── db_common.sh                # shared connection and safety helpers
+│   └── tests/test_db_scripts.py    # script safety tests (stubbed PostgreSQL tools)
 ├── .dockerignore                   # keeps secrets, venvs, databases out of the image
 ├── .env.example                    # template for local .env (placeholders only)
 ├── .gitignore
@@ -237,12 +248,12 @@ All Python dependencies, including transitive ones, are pinned to exact versions
 | `apps/tasks/views.py` | Function-based views, all `@login_required` and owner-scoped. `task_list` also builds the dashboard statistics. |
 | `apps/tasks/tasks.py` | `find_overdue_tasks`, a read-only Celery task. |
 | `apps/tasks/tests.py` | Tests for the model, form, views, access control, filters, dashboard statistics, and the Celery task. |
-| `config/settings.py` | Loads `.env`, requires `DJANGO_SECRET_KEY`, selects SQLite or PostgreSQL via `DB_ENGINE`, and defines Celery settings. |
+| `config/settings.py` | Loads `.env`, requires `DJANGO_SECRET_KEY`, reads `DEBUG`, hosts and HTTPS settings from the environment, configures WhiteNoise static files, selects SQLite or PostgreSQL via `DB_ENGINE`, and defines Celery settings. |
 | `config/celery.py` | Creates the Celery app, reads `CELERY_*` settings from Django, and autodiscovers `tasks.py` modules in installed apps. |
 | `config/__init__.py` | Imports the Celery app when Django starts so `@shared_task` functions bind to it. |
 | `config/urls.py` | Mounts the admin at `/admin/`, task views at `/` (and `/tasks/` for backward compatibility), and auth views at `/accounts/`. |
 | `Dockerfile` | Builds the image shared by `web` and `worker`. |
-| `.dockerignore` | Excludes `.env*` (except `.env.example`), virtual environments, `.git/`, bytecode, SQLite files, and personal notes from the build context. |
+| `.dockerignore` | Excludes `.env*` (except `.env.example`), virtual environments, `.git/`, bytecode, locally collected `staticfiles/`, SQLite files, and personal notes from the build context. |
 | `compose.yaml` | Declares the four services, health checks, dependencies, env files, and the PostgreSQL volume. |
 | `.github/workflows/ci.yml` | CI workflow definition. |
 | `requirements.txt` | Exact-pinned dependency set for the image, CI, and local installs. |
@@ -291,7 +302,17 @@ scheduled independently.
 ### The `find_overdue_tasks` task
 
 ```python
-@shared_task
+@shared_task(
+    autoretry_for=(OperationalError,),
+    max_retries=5,
+    retry_backoff=2,
+    retry_backoff_max=60,
+    retry_jitter=True,
+    acks_late=True,
+    track_started=True,
+    soft_time_limit=30,
+    time_limit=60,
+)
 def find_overdue_tasks():
     today = timezone.localdate()
     overdue = (
@@ -301,6 +322,7 @@ def find_overdue_tasks():
         .order_by('due_date', 'id')
     )
     overdue_ids = list(overdue.values_list('id', flat=True))
+    logger.info('Found %d overdue task(s) on %s', len(overdue_ids), today.isoformat())
     return {
         'checked_on': today.isoformat(),
         'overdue_count': len(overdue_ids),
@@ -316,6 +338,30 @@ def find_overdue_tasks():
   concurrent edits, and auditing that this project does not yet address, so the task
   reports and leaves decisions to the application. A test asserts that task rows are
   unchanged after it runs.
+- It is **idempotent** because it is read-only: running it twice gives the same result
+  and changes nothing, so retries and redelivery are safe. Each run reports the state at
+  the time it succeeds.
+
+### Reliability
+
+| Option | What it does | Trade-off |
+| --- | --- | --- |
+| `autoretry_for=(OperationalError,)` | Retries database connection failures only. Programming errors fail immediately. | `OperationalError` also covers permanent faults (wrong password, missing database); those use up the retries (about a minute) before failing. |
+| `max_retries=5` | At most 6 attempts, then `FAILURE`. | An outage longer than about a minute still fails the task. |
+| `retry_backoff=2`, `retry_backoff_max=60`, `retry_jitter=True` | Waits of up to 2, 4, 8, 16 and 32 seconds, each randomised between 0 and that value so retries do not arrive together. | Results arrive up to about a minute late during an outage. |
+| `acks_late=True` | The message is acknowledged after the task finishes, so a task interrupted by the whole worker stopping is redelivered instead of lost. | The task may run more than once, which is safe because it is read-only. With Redis, redelivery after a hard crash happens only after the broker's visibility timeout (1 hour by default). |
+| `reject_on_worker_lost` (not set) | If the child process running the task dies, the task is recorded as `FAILURE` (`WorkerLostError`) rather than requeued. | Deliberate: requeuing on every crash could redeliver without limit, outside the retry budget. |
+| `track_started=True` | A running task reports `STARTED` instead of `PENDING`. | One extra small Redis write per run. |
+| `soft_time_limit=30`, `time_limit=60` | An exception after 30 seconds; the process is killed after 60. | A legitimately slow run would be stopped; the query takes milliseconds. |
+
+PostgreSQL connections also use `connect_timeout=10`, so an unreachable server raises
+`OperationalError` after 10 seconds (which the task retries) instead of hanging.
+
+**Failure visibility.** Each retry is logged by the worker at `INFO`
+(`… retry: Retry in 4s: OperationalError(...)`) and the state is `RETRY`. A final
+failure is logged at `ERROR` with the traceback, and the result backend stores state
+`FAILURE` with the original exception for 24 hours; `AsyncResult.get()` re-raises it.
+A successful run logs `Found N overdue task(s) on DATE`.
 
 ### Execution flow
 
@@ -344,7 +390,7 @@ sequenceDiagram
 
 > **Scope:** TaskFlow currently demonstrates **on-demand** task execution. No view
 > enqueues the task, and **Celery Beat is not configured**, so nothing runs on a
-> schedule. Retries and error handling policies are not yet defined.
+> schedule. Retries and failure handling are described under [Reliability](#reliability).
 
 ---
 
@@ -366,23 +412,29 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+RUN DJANGO_SECRET_KEY=collectstatic-build-only python manage.py collectstatic --noinput
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--access-logfile", "-"]
 ```
 
 - Dependencies are installed **before** the source is copied, so code-only changes reuse
   the cached dependency layer.
-- The image is tagged `taskflow-web:dev` and is used by both `web` and `worker`. The
-  worker overrides `CMD` with the Celery command.
+- Static files are collected at build time into `/app/staticfiles`. Settings refuse to
+  load without a secret key, so the build step passes a placeholder that exists only for
+  that command and is not stored in the image. No database is needed.
+- The default command runs **Gunicorn** (production). Set `WEB_CONCURRENCY` to choose the
+  number of worker processes (Gunicorn's default is 1). Migrations are never run on start.
+- The image is tagged `taskflow-web:dev` and is used by both `web` and `worker`. In
+  Compose, `web` overrides the command with `runserver` and sets `DJANGO_DEBUG=true` for
+  development; the worker overrides it with the Celery command.
 - Source code is copied into the image (no bind mount), so code changes require a
   rebuild.
-- It is explicitly a **development image**: it runs Django's development server and runs
-  as root.
+- It still runs as root, and the same image serves development and production.
 
 ### Services
 
 | Service | Image | Role | Host port | Health check |
 | --- | --- | --- | --- | --- |
-| `web` | `taskflow-web:dev` (built) | Django on the development server | `8001 → 8000` | none |
+| `web` | `taskflow-web:dev` (built) | Django on the development server (`runserver`, `DJANGO_DEBUG=true`) | `8001 → 8000` | none |
 | `worker` | `taskflow-web:dev` | `celery -A config worker --loglevel=info` | none | none |
 | `db` | `postgres:18-alpine` | Application database | none | `pg_isready -h 127.0.0.1` every 5 s |
 | `redis` | `redis:8-alpine` | Celery broker and result backend | none | `redis-cli ping` every 5 s |
@@ -448,8 +500,22 @@ priority.
 | `DJANGO_SECRET_KEY` | Always | Django's signing key. Start-up fails with `ImproperlyConfigured` if missing. |
 | `DB_ENGINE` | No | `sqlite` (default) or `postgres`. Any other value raises `ImproperlyConfigured`. |
 | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT` | When `DB_ENGINE=postgres` | Connection settings. If any is empty, the error names the missing variables but never prints values. |
+| `POSTGRES_SSLMODE` | No | libpq TLS mode for the PostgreSQL connection, e.g. `require` for Neon or `verify-full` to also check the certificate. Unset keeps libpq's default (`prefer`), as used locally and by Compose. The backup and restore scripts pass it on as `PGSSLMODE`. |
 | `CELERY_BROKER_URL` | No | Broker URL. Defaults to `redis://127.0.0.1:6379/0`; Compose sets `redis://redis:6379/0`. |
 | `CELERY_RESULT_BACKEND` | No | Defaults to the broker URL. |
+| `DJANGO_DEBUG` | No | `true` for development. **Defaults to `false`**, so a deployment that forgets it is never in debug mode. `.env.example` and `compose.yaml` set it to `true`. |
+| `DJANGO_ALLOWED_HOSTS` | In production | Comma-separated host names. Empty by default; while `DEBUG` is on, Django still allows `localhost`, `127.0.0.1` and `[::1]`. |
+| `DJANGO_CSRF_TRUSTED_ORIGINS` | No | Comma-separated full origins (e.g. `https://taskflow.example.com`), for forms posted from an origin Django does not treat as its own. |
+| `DJANGO_SECURE_SSL_REDIRECT` | No | Production only. Redirect HTTP to HTTPS; defaults to `true`. CI turns it off for the test run only. |
+| `DJANGO_BEHIND_TLS_PROXY` | No | Production only. `true` trusts the `X-Forwarded-Proto` header; set it only behind a proxy you control that terminates TLS. Defaults to `false`. |
+| `DJANGO_SECURE_HSTS_SECONDS` | No | Production only. **Defaults to `0` (HSTS off)** until HTTPS is verified on the real domain; then raise it gradually. |
+| `DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS` | No | Production only. Defaults to `false`; enable only once every subdomain is served over HTTPS. |
+| `DJANGO_SECURE_HSTS_PRELOAD` | No | Production only. Defaults to `false`; preload-list submission is effectively permanent, so enable only deliberately. |
+| `DJANGO_EMAIL_BACKEND` | No | Dotted path of the email backend. Defaults to the console backend when `DEBUG` is on and the SMTP backend when it is off. TaskFlow does not send email yet; configure SMTP host settings before it does. |
+
+When `DJANGO_DEBUG` is `false`, settings also mark session and CSRF cookies `Secure`, and
+static files are stored with compressed, content-hashed names, which requires running
+`collectstatic` first. When it is `true`, `runserver` serves app static files directly.
 
 `.env.example` is the committed template for local development. It contains placeholders
 only.
@@ -480,6 +546,140 @@ Schema changes are tracked in `apps/tasks/migrations/` (`0001_initial`,
 explicitly with `manage.py migrate`; containers do not apply them automatically on
 start. CI fails if a model change has no matching migration.
 
+## Backup and Restore
+
+TaskFlow's data lives in PostgreSQL. Two scripts in `scripts/` back it up and restore it
+safely. Both are manual: there is no schedule and no off-site copy.
+
+### What a backup contains
+
+A backup is a complete logical copy of **one database**: every table's schema and data,
+indexes, constraints, sequences and their current values, and the `django_migrations`
+history. For TaskFlow that includes:
+
+- **users**: usernames, email addresses, and **password hashes** (`pbkdf2_sha256`);
+- **sessions**: `django_session` rows, whose keys act as login credentials until they
+  expire;
+- **tasks**, the admin log, permissions, and content types.
+
+It does **not** contain PostgreSQL roles or their passwords, server settings, Redis
+data, `.env` files, the Django secret key, or static files.
+
+### Why the custom format
+
+`pg_dump -Fc` writes one compressed file that `pg_restore` can **inspect without
+restoring** (`--list`), restore selectively, and restore inside a single transaction.
+A plain SQL dump has none of these properties and is larger.
+
+### Live database vs restore target
+
+| | Live database | Restore target |
+| --- | --- | --- |
+| What it is | The database TaskFlow uses (`POSTGRES_DB`, `taskflow` in this project) | A separate, **empty** database you create for the restore, e.g. `taskflow_restore_check` |
+| Backup script | Reads it (read-only `pg_dump`) | — |
+| Restore script | **Refuses** it, by configured name and by the name recorded in the archive | Restores into it only if it exists and contains no objects |
+| Disposable? | **No** | Yes, once you have checked it; drop it yourself, by exact name |
+
+The scripts never create, drop, or clean a database, and never use `pg_restore --clean`
+or `--create`.
+
+### Back up
+
+```bash
+# Database from .env (or POSTGRES_* in the environment), using local client tools
+scripts/db_backup.sh
+
+# The Docker Compose db service (runs pg_dump inside the container; no host tools needed)
+scripts/db_backup.sh --compose
+```
+
+Each run writes `~/taskflow-backups/taskflow-<label>-YYYYMMDD-HHMMSS.dump` and a
+matching `.sha256` checksum (label `local` or `docker`; change it with `--label`, the
+directory with `--dir` or `TASKFLOW_BACKUP_DIR`). The script:
+
+- dumps into a temporary file and keeps it only if `pg_dump` succeeds and `pg_restore`
+  can read the result, so a failed run leaves nothing that looks like a backup;
+- never overwrites an existing file, and refuses directories inside the repository;
+- creates files with mode `600` in a directory with mode `700`;
+- passes the database password only through `PGPASSWORD` to `pg_dump`, never on a
+  command line or in its output, and `POSTGRES_SSLMODE` (if set) as `PGSSLMODE`.
+
+Host mode needs PostgreSQL client tools at least as new as the server (18).
+
+### Verify an archive
+
+```bash
+cd ~/taskflow-backups
+shasum -a 256 -c taskflow-local-20261125-205626.dump.sha256   # Linux: sha256sum -c
+pg_restore --list taskflow-local-20261125-205626.dump | head -12   # header: dbname, versions
+pg_restore --list taskflow-local-20261125-205626.dump | grep -c ' TABLE DATA '   # 11 tables
+```
+
+### Restore into a disposable database
+
+1. Create an **empty** target database. Pick a new name; never reuse the live one.
+
+   ```bash
+   createdb -h 127.0.0.1 -U taskflow_user taskflow_restore_check          # local server
+   docker compose exec db sh -c 'createdb -U "$POSTGRES_USER" taskflow_restore_check'   # Compose
+   ```
+
+2. Restore. `--target` is required; there is no default.
+
+   ```bash
+   scripts/db_restore.sh --target taskflow_restore_check ~/taskflow-backups/taskflow-local-20261125-205626.dump
+   scripts/db_restore.sh --compose --target taskflow_restore_check ~/taskflow-backups/taskflow-docker-....dump
+   ```
+
+Before restoring, the script checks the `.sha256` checksum (when present), that the
+file is a valid archive, that the target is not the live database or a system database,
+and that the target exists and is empty. It then runs `pg_restore --single-transaction
+--exit-on-error --no-owner --no-acl`: the restore either completes or is rolled back
+completely, and the script exits non-zero with an error. Objects are owned by the role
+that restores them and grants are not restored, so a restored database that an
+application role will use needs its privileges granted again.
+
+### Verifying a restore
+
+```bash
+# 1. Row counts: run on both databases and compare
+for db in taskflow taskflow_restore_check; do
+  echo "== $db"
+  psql -h 127.0.0.1 -U taskflow_user -d "$db" -At -c "
+    SELECT 'auth_user', count(*) FROM auth_user UNION ALL
+    SELECT 'tasks_task', count(*) FROM tasks_task UNION ALL
+    SELECT 'django_migrations', count(*) FROM django_migrations ORDER BY 1"
+done
+
+# 2. Django sees a fully migrated schema and can read the data
+POSTGRES_DB=taskflow_restore_check python manage.py migrate --check
+POSTGRES_DB=taskflow_restore_check python manage.py shell -c \
+  "from apps.tasks.models import Task; print(Task.objects.count())"
+
+# 3. Remove the disposable database when finished (exact name; never the live one)
+dropdb -h 127.0.0.1 -U taskflow_user taskflow_restore_check
+```
+
+The live database changes after a backup, so compare counts promptly or expect
+differences that match activity since the backup.
+
+**Recovering for real** is a deliberate manual step: restore into a new database, verify
+it as above, then point `POSTGRES_DB` at it (or rename databases during downtime). The
+restore script will not write over the live database.
+
+### Protecting backup files
+
+Backups contain personal data, password hashes, and session keys, so treat them like
+the `.env` files:
+
+- keep them outside the repository (the backup script enforces this; `*.dump` is also in
+  `.gitignore` and `.dockerignore`);
+- keep permissions at `600` for files and `700` for the directory;
+- encrypt a backup before copying it off this machine, and do not attach it to tickets
+  or chat;
+- delete old backups deliberately once they are no longer needed. A restored copy of
+  `django_session` still contains valid sessions until they expire.
+
 ---
 
 ## CI and Automated Testing
@@ -492,18 +692,23 @@ start. CI fails if a model change has no matching migration.
 | Runner | `ubuntu-latest`, 15-minute timeout, `contents: read` permissions |
 | Python | Version read from `.python-version` (3.13) via `actions/setup-python@v7`, with pip caching keyed on `requirements.txt` |
 | Database | `postgres:18` service container, health-checked with `pg_isready` before steps run |
-| Configuration | Job-level environment variables with disposable CI-only values; `DB_ENGINE=postgres` |
+| Configuration | Job-level environment variables with disposable CI-only values; `DB_ENGINE=postgres`; `DJANGO_DEBUG` unset, so production settings apply |
 | Install | `python -m pip install -r requirements.txt` |
 | Step 1 | `python manage.py check` — Django system checks; also proves settings load from the environment |
 | Step 2 | `python manage.py makemigrations --check --dry-run` — fails if models and migrations are out of sync |
-| Step 3 | `python manage.py test` — creates a test database on PostgreSQL, runs all tests, drops it |
+| Step 3 | `python manage.py collectstatic --noinput` — required because the job uses production static storage |
+| Step 4 | `python manage.py test` — creates a test database on PostgreSQL, runs all tests, drops it. Runs with production settings except `DJANGO_SECURE_SSL_REDIRECT=false`, because Django's test client speaks plain HTTP |
+| Step 5 | `python manage.py check --deploy --fail-level WARNING` — fails on any deployment warning. Uses a synthetic environment: a long placeholder key, a placeholder host, and check-only HSTS values (`DJANGO_SECURE_HSTS_SECONDS=1`, include-subdomains and preload `true`). Real deployments keep HSTS off (`0`, `false`, `false`) until HTTPS is verified |
+| Step 6 | Starts Gunicorn and fetches `/static/tasks/css/style.css` and `/static/admin/css/base.css` through WhiteNoise, sending `X-Forwarded-Proto: https` as a TLS proxy would |
+| Step 7 | `python -m unittest discover -s scripts/tests` — backup and restore script safety tests with stubbed PostgreSQL tools |
 
 Redis and Celery workers are not needed in CI: the Celery tests call the task with
-`.apply()`, which executes it in-process without a broker.
+`.apply()`, which executes it in-process without a broker. Under `.apply()`, retries run
+immediately without waiting for the back-off delay, so the retry tests are fast.
 
 ### Test suite
 
-56 tests built on Django's `TestCase`:
+62 tests built on Django's `TestCase`:
 
 | Area | Tests |
 | --- | --- |
@@ -513,15 +718,26 @@ Redis and Celery workers are not needed in CI: the Celery tests call the task wi
 | Task list, create, edit, delete views, including cross-user 404s | 13 |
 | Search and filtering | 8 |
 | Dashboard statistics | 5 |
-| Celery task: overdue, completed, not-yet-due, no due date, read-only | 4 |
+| Celery task: overdue, completed, not-yet-due, no due date, read-only, repeat runs, success log | 6 |
+| Celery reliability: transient retry then success, failure after the retry limit, no retry for programming errors, task options | 4 |
 | Registration | 5 |
 | Login and logout | 7 |
 
 ### Verified results
 
-- **Locally:** all 56 tests pass on SQLite, inside the Docker `web` container against
-  PostgreSQL 18, and against a disposable PostgreSQL 18 container using the CI
-  configuration.
+- **Locally:** the original 56 tests pass on SQLite, inside the Docker `web` container
+  against PostgreSQL 18, and against a disposable PostgreSQL 18 container using the CI
+  configuration. The 62-test suite, including the Celery reliability tests, passes on
+  SQLite and on PostgreSQL 18.6.
+- **Backup and restore:** a backup of the local PostgreSQL `taskflow` database was
+  restored into a new, empty disposable database. All 11 tables matched the source in
+  row count and content hash, as did sequences, indexes, constraints, and the 20 applied
+  migrations; `migrate --check` passed against the restored database, and the
+  disposable database was then dropped. A restore of a deliberately corrupted archive
+  failed, rolled back, and left the target empty.
+- **Retry behaviour with a real worker:** with the database unreachable, a worker logged
+  five retries with randomised waits within the 2/4/8/16/32-second ceilings, then an
+  `ERROR` and a stored `FAILURE`.
 - **GitHub Actions:** the first workflow run on `main` (commit `fc9b9d4`) passed all steps,
   including 56 tests on Python 3.13 with the PostgreSQL 18 service. The badge at the top of
   this README shows the latest status.
@@ -560,7 +776,7 @@ Generate a secret key and paste it into `.env` as `DJANGO_SECRET_KEY='...'`:
 python -c "from django.core.management.utils import get_random_secret_key as k; print(k())"
 ```
 
-Keep `DB_ENGINE=sqlite`, then:
+Keep `DJANGO_DEBUG=true` and `DB_ENGINE=sqlite`, then:
 
 ```bash
 python manage.py migrate
@@ -569,6 +785,10 @@ python manage.py runserver
 ```
 
 Open http://127.0.0.1:8000/.
+
+> **Existing `.env` files:** settings now default to `DEBUG` off. If your `.env` predates
+> `DJANGO_DEBUG`, add `DJANGO_DEBUG=true`; otherwise `runserver` rejects requests (empty
+> `ALLOWED_HOSTS`) and redirects to HTTPS.
 
 To use a local PostgreSQL server instead, set `DB_ENGINE=postgres` and fill in the
 `POSTGRES_*` values in `.env`. To run Celery outside Docker you would also need a local
@@ -697,6 +917,153 @@ python manage.py check
 python manage.py makemigrations --check --dry-run
 ```
 
+### Running the production configuration
+
+The image's default command is Gunicorn with `DJANGO_DEBUG` unset (off). A deployment
+provides at least `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS` and the database variables
+(plus `CELERY_BROKER_URL` where a worker runs), and applies migrations as a separate step. Behind a TLS-terminating
+proxy, also set `DJANGO_BEHIND_TLS_PROXY=true`. Leave `DJANGO_SECURE_HSTS_SECONDS` at `0`
+until HTTPS works on the real domain.
+
+```bash
+# The deployment check CI runs (synthetic values, check only)
+DJANGO_SECRET_KEY=ci-deploy-check-only-1f8c2b7e9a4d6f03c5b1e8a7d2f9c4b6e0a3d7f1 \
+DJANGO_ALLOWED_HOSTS=taskflow.example.invalid DJANGO_SECURE_HSTS_SECONDS=1 \
+DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=true DJANGO_SECURE_HSTS_PRELOAD=true \
+DJANGO_DEBUG=false python manage.py check --deploy --fail-level WARNING
+```
+
+For a free hosted deployment, see the next section.
+
+---
+
+## Deploying to Render and Neon (free tiers)
+
+The web app runs on a **Render Free** web service built from the `Dockerfile` (Gunicorn
+and WhiteNoise, unchanged), and the data lives in **Neon Free** PostgreSQL. Celery and
+Redis are **not** deployed: they stay in the local Compose environment. No view enqueues
+a task, so the web app does not need a broker. Neither service needs a paid plan here.
+
+```
+Browser --HTTPS--> Render proxy (terminates TLS) --HTTP + X-Forwarded-Proto--> Gunicorn :8000
+                                                                                   |
+                                                       TLS (sslmode=require) ------+--> Neon PostgreSQL
+```
+
+Free-tier behaviour to expect:
+
+- **Render Free** spins the service down after 15 minutes without traffic; the next
+  request waits about a minute. There is no shell, no pre-deploy command and no persistent
+  disk, so migrations are run from your machine (below) and SQLite must not be used.
+- **Neon Free** suspends the database compute when idle; the first query afterwards takes
+  a moment longer. `connect_timeout` (10 s) covers this.
+
+### 1. The Neon database and connection file
+
+The Neon project runs PostgreSQL 18 and is reached through its **direct** connection
+(host *without* `-pooler`). TaskFlow opens one connection per request with a single
+Gunicorn worker, so the pooler is not needed, and Neon recommends the direct connection
+for migrations and restores.
+
+TaskFlow's production database is **`taskflow_prod`**, a separate database in that
+project. Neon's default `neondb` is used only as a connection starting point for the
+backup and restore scripts and holds no TaskFlow data.
+
+The connection details live in a private file **outside the repository**,
+`~/.config/taskflow/neon.env` (directory `700`, file `600`):
+
+```bash
+POSTGRES_DB=neondb
+POSTGRES_USER=neondb_owner
+POSTGRES_PASSWORD='paste-the-neon-password'
+POSTGRES_HOST=ep-example-123456.us-east-2.aws.neon.tech
+POSTGRES_PORT=5432
+POSTGRES_SSLMODE=require
+```
+
+Neon accepts only TLS connections; `require` encrypts them. `verify-full` additionally
+checks Neon's certificate against a CA file named in `PGSSLROOTCERT`.
+
+### 2. Production data: already transferred and verified
+
+The existing users (including the admin account) and tasks were moved from the Docker
+Compose database to `taskflow_prod` with the backup and restore process in
+[Backup and Restore](#backup-and-restore):
+
+1. `scripts/db_backup.sh --compose` took a checksummed custom-format archive of the
+   Docker database, with `web` and `worker` stopped.
+2. `scripts/db_restore.sh --env-file ~/.config/taskflow/neon.env --target taskflow_prod`
+   restored it into the empty `taskflow_prod` in a single transaction, over TLS.
+3. Verification: row counts and content checksums of every table, sequence values,
+   indexes, constraints and columns matched the Docker source exactly; `migrate --check`
+   reported all 20 migrations applied; Django read 4 users and 5 tasks.
+
+> **The initial Render deployment must NOT run migrations or restore again.**
+> `taskflow_prod` is already restored, fully migrated and verified. Restoring again is
+> refused anyway (the target is no longer empty), and `createsuperuser` is not needed
+> because the existing admin account was preserved.
+
+#### Later: applying a new migration (deliberately, from your machine)
+
+Containers never migrate on start, and Render Free has no shell or pre-deploy command.
+When a future release adds a migration, apply it from your machine **before** deploying
+the code that needs it (keep migrations backwards-compatible with the running code,
+e.g. add nullable columns first):
+
+```bash
+# In a subshell, so the Neon settings do not stay in your terminal.
+# DB_ENGINE and POSTGRES_DB are set explicitly AFTER loading neon.env, so neither the
+# neon.env value (neondb) nor anything in your local .env can select the database.
+(
+  set -a; . ~/.config/taskflow/neon.env; set +a
+  export DB_ENGINE=postgres POSTGRES_DB=taskflow_prod
+  scripts/db_backup.sh --env-file ~/.config/taskflow/neon.env --label neon  # backup first
+  python manage.py migrate --plan      # review what will run
+  python manage.py migrate
+  python manage.py migrate --check     # exit 0 = nothing unapplied
+  # python manage.py createsuperuser   # optional: only if another admin account is needed
+)
+```
+
+The backup needs `pg_dump` at least as new as Neon's PostgreSQL version (18).
+
+### 3. Create the Render web service
+
+New → Web Service → this repository, **Language: Docker**, **Instance type: Free**.
+Replace `taskflow-xyz` below with the service's `onrender.com` name.
+
+| Variable | Value |
+| --- | --- |
+| `DJANGO_SECRET_KEY` | A new random value: `python -c "import secrets; print(secrets.token_urlsafe(50))"` |
+| `DB_ENGINE` | `postgres` |
+| `POSTGRES_DB` | `taskflow_prod` (not `neondb`) |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT` | From Neon's direct connection (the same values as in `neon.env`) |
+| `POSTGRES_SSLMODE` | `require` |
+| `DJANGO_ALLOWED_HOSTS` | `taskflow-xyz.onrender.com` |
+| `DJANGO_CSRF_TRUSTED_ORIGINS` | `https://taskflow-xyz.onrender.com` (not strictly required with the proxy setting below, but harmless and explicit) |
+| `DJANGO_BEHIND_TLS_PROXY` | `true`: Render terminates TLS and sets `X-Forwarded-Proto`, so Django sees HTTPS requests, redirects plain HTTP, and its `Secure` cookies work |
+| `PORT` | `8000`: Render routes to `$PORT` (default 10000), and the image's Gunicorn listens on 8000 |
+
+Leave unset: `DJANGO_DEBUG` (defaults to off), `DJANGO_SECURE_SSL_REDIRECT` (defaults to
+on), the HSTS variables (off until HTTPS is verified; Render serves `onrender.com` over
+HTTPS, but raise HSTS gradually and deliberately), and `CELERY_*`. Leave the **Health Check
+Path** empty, so Render uses its default TCP check; TaskFlow has no health endpoint yet.
+
+When you add a custom domain, append it to both `DJANGO_ALLOWED_HOSTS` and
+`DJANGO_CSRF_TRUSTED_ORIGINS`.
+
+### 4. Check the deployment
+
+- `https://taskflow-xyz.onrender.com/accounts/login/` loads, styled (WhiteNoise CSS).
+- `http://` redirects to `https://` without looping (a loop means
+  `DJANGO_BEHIND_TLS_PROXY` is not `true`).
+- Logging in and the admin work (CSRF and session cookies over HTTPS).
+- Existing users, including the admin account, can log in with their current passwords
+  and see their tasks.
+- Optionally, confirm nothing is unapplied, with the same explicit settings as above
+  (this only reads): `( set -a; . ~/.config/taskflow/neon.env; set +a; export
+  DB_ENGINE=postgres POSTGRES_DB=taskflow_prod; python manage.py migrate --check )`.
+
 ---
 
 ## Engineering Decisions and Trade-offs
@@ -713,17 +1080,28 @@ python manage.py makemigrations --check --dry-run
 
 ### Current limitations
 
-- **Development server only.** Both Docker and local runs use `manage.py runserver`.
-  There is no Gunicorn/Uvicorn or reverse proxy.
-- **Development settings are hardcoded.** `DEBUG = True` and `ALLOWED_HOSTS = []` are
-  in `config/settings.py`, and `STATIC_ROOT`/`collectstatic` are not configured.
-- **No deployment.** The project runs only on a developer machine; there is no cloud
-  hosting, domain, or TLS.
+- **Production serving relies on a hosting proxy for TLS.** The image runs Gunicorn with
+  WhiteNoise, with no reverse proxy in this repository; HTTPS comes from the host (Render
+  in the documented free deployment). Compose still runs `runserver` for development.
+- **HSTS is off** (`DJANGO_SECURE_HSTS_SECONDS=0`, include-subdomains and preload
+  `false`) until HTTPS is verified on a real domain.
+- **No real email delivery.** Production defaults to the SMTP backend, but no SMTP host
+  is configured; nothing in TaskFlow sends email yet.
+- **Deployment is documented, not automated.** The free Render + Neon setup is a manual
+  procedure; there is no CD stage, custom domain, or background worker in it.
+- **Server errors are not logged with tracebacks in production.** With `DEBUG` off and
+  no `LOGGING` setting, Django sends unhandled exceptions only to `mail_admins`, which is
+  not configured; the Gunicorn access log shows the `500` status only.
 - **Containers run as root**, and Celery logs a warning about it.
 - **Redis has no authentication or persistence configuration.** It is protected only by
   not being published to the host.
-- **Background tasks are on-demand only.** There is no Celery Beat schedule, retry
-  policy, or monitoring of task failures, and no view enqueues the task.
+- **Background tasks are on-demand only.** There is no Celery Beat schedule or
+  monitoring of task failures beyond worker logs and the result backend, and no view
+  enqueues the task.
+- **No worker restart policy.** A worker container that crashes stays down until
+  restarted.
+- **Backups are manual.** There is no schedule, retention policy, encryption at rest,
+  or off-site copy; `scripts/db_backup.sh` must be run by hand.
 - **Manual setup steps.** The application database role must be created by hand, and
   migrations are not applied automatically on container start.
 - **No health checks for `web` or `worker`.** Compose reports them as running, not
@@ -738,15 +1116,14 @@ python manage.py makemigrations --check --dry-run
 
 These are **planned, not implemented**, roughly in priority order.
 
-1. **Production server and reverse proxy.** Gunicorn (or Uvicorn for ASGI) behind Nginx
-   or a managed load balancer, with static files collected and served properly.
-2. **Hardened configuration and containers.** `DEBUG` and `ALLOWED_HOSTS` from the
-   environment, secure cookie and HTTPS settings, `check --deploy` in CI, a non-root
-   container user, and a slimmer production image.
+1. **TLS in front of Gunicorn.** A managed load balancer or reverse proxy terminating
+   HTTPS, then enabling HSTS gradually once HTTPS is verified.
+2. **Hardened containers.** A non-root container user and a slimmer, multi-stage
+   production image.
 3. **Redis hardening.** Authentication, and persistence (AOF or RDB on a volume) where
    losing queued tasks matters.
-4. **Reliable background jobs.** Celery Beat for a scheduled overdue check, retry policies
-   with back-off, idempotent task design, and time limits.
+4. **Scheduled background jobs.** Celery Beat for a scheduled overdue check, and a worker
+   restart policy.
 5. **Observability.** Structured logging, error tracking, health endpoints for `web` and
    `worker`, and task monitoring (for example Flower).
 6. **Cloud deployment.** A managed PostgreSQL and Redis, container hosting, secrets
